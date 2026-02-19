@@ -9,12 +9,14 @@ A Gradio-based app for:
 Run with: python app.py
 Then open http://localhost:7860 in your browser
 """
+from __future__ import annotations
 
 import gradio as gr
 from jellyfin_client import JellyfinClient
 from spotify_client import SpotifyClient
 from duplicate_finder import DuplicateFinder, DuplicateGroup
 import random
+from typing import Any
 
 jellyfin_client: JellyfinClient | None = None
 spotify_client: SpotifyClient | None = None
@@ -53,7 +55,7 @@ def connect_spotify(client_id: str, client_secret: str) -> str:
         return f"❌ Spotify connection failed: {e}"
 
 
-def scan_duplicates(threshold: int) -> tuple[str, str, gr.Update, gr.Update]:
+def scan_duplicates(threshold: int) -> tuple[str, str, Any, Any]:
     global duplicate_groups, current_group_index
 
     if not jellyfin_client:
