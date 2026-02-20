@@ -155,6 +155,70 @@ class JellyfinClient:
         params = {"Ids": ",".join(item_ids)}
         self._post(f"/Playlists/{playlist_id}/Items", params=params)
 
+    def get_all_playlists(self) -> list[dict]:
+        params = {
+            "IncludeItemTypes": "Playlist",
+            "Recursive": "true",
+            "Fields": "ChildCount,Overview,Path,MediaSources",
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
+    def delete_item(self, item_id: str) -> None:
+        resp = requests.delete(
+            f"{self.base_url}/Items/{item_id}",
+            headers=self._headers(),
+            timeout=30,
+        )
+        if not resp.ok:
+            body = ""
+            try:
+                body = resp.json().get("Message", resp.text[:300])
+            except Exception:
+                body = resp.text[:300]
+            raise RuntimeError(f"HTTP {resp.status_code}: {body}")
+
+    def get_all_artists_raw(self) -> list[dict]:
+        """Return raw artist dicts including ImageTags for artwork detection."""
+        params = {
+            "IncludeItemTypes": "MusicArtist",
+            "Recursive": "true",
+            "Fields": "ChildCount,SortName,ImageTags,PrimaryImageAspectRatio",
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
+    def get_all_albums_raw(self) -> list[dict]:
+        """Return raw album dicts including ImageTags for artwork detection."""
+        params = {
+            "IncludeItemTypes": "MusicAlbum",
+            "Recursive": "true",
+            "Fields": "ChildCount,SortName,ImageTags,AlbumArtist",
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
+    def refresh_item_metadata(self, item_id: str) -> None:
+        params = {
+            "MetadataRefreshMode": "FullRefresh",
+            "ImageRefreshMode": "FullRefresh",
+            "ReplaceAllMetadata": "false",
+            "ReplaceAllImages": "false",
+        }
+        resp = requests.post(
+            f"{self.base_url}/Items/{item_id}/Refresh",
+            headers=self._headers(),
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
     def _fuzzy_match(self, a: str, b: str) -> bool:
         if not a or not b:
             return False
