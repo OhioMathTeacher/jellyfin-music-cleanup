@@ -784,7 +784,7 @@ The SSH connection is made from **this machine** to the Jellyfin server.
                 ssh_host = gr.Textbox(label="Hostname / IP", placeholder="fedora.tail7162dd.ts.net  (just the hostname — you can paste your Jellyfin URL and it will be cleaned up)")
                 ssh_port = gr.Textbox(label="Port", value="22", scale=0)
             with gr.Row():
-                ssh_user = gr.Textbox(label="Username", placeholder="todd")
+                ssh_user = gr.Textbox(label="OS Username (not your Jellyfin account)", placeholder="todd")
                 ssh_pass = gr.Textbox(label="Password (optional)", type="password")
                 ssh_key  = gr.Textbox(label="SSH Key Path (optional)", placeholder="~/.ssh/id_ed25519")
             ssh_connect_btn = gr.Button("Connect via SSH")
