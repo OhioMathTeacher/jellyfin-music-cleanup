@@ -264,11 +264,20 @@ def delete_selected_playlists(selected: list[str]) -> str:
 # Junk Artists
 # ---------------------------------------------------------------------------
 
+# Well-known artists whose names would otherwise trigger junk rules
+_JUNK_WHITELIST = {
+    "a", "x", "u2", "l7", "oz", "p!nk", "sia", "elo", "reo", "bad", "yes",
+    "ratt", "tool", "cake", "hole", "bush", "live", "ride", "wire", "gang",
+    "2wo", "3eb", "10cc", "inxs", "nofx", "mxpx", "acdc", "ac/dc", "ac-dc",
+}
+
 _JUNK_RULES: list[tuple[str, str]] = [
     (r'^\d+$', "numeric only"),
-    (r'^.{1,2}$', "≤2 characters"),
+    (r'^.{1,2}$', "\u22642 characters"),
     (r'^\d', "starts with digit"),
-    (r'^[A-Za-z0-9]{12,}$', "looks like a username/ID"),
+    # Only flag long ALL-CAPS or no-vowel strings — not normal band names
+    (r'^[A-Z0-9]{12,}$', "long all-caps string"),
+    (r'(?i)\b(albums?|collections?|playlists?|discs?|volumes?|vol\.|tracks?|songs?|greatest hits|best of|anthology|box set|boxset|rarities|singles?|b-sides?)\b', "looks like a category/label"),
 ]
 
 
@@ -282,11 +291,12 @@ def scan_junk_artists() -> tuple[str, Any]:
         for a in raw:
             name = a.get("Name", "")
             reasons = [label for pattern, label in _JUNK_RULES if re.match(pattern, name)]
-            if reasons:
+            if reasons and name.lower() not in _JUNK_WHITELIST:
                 flagged.append((a, reasons))
         junk_artist_candidates = [a for a, _ in flagged]
         if not flagged:
             return "✅ No junk artists found", gr.update(choices=[], visible=False)
+        flagged.sort(key=lambda x: x[0].get("Name", "").lower())
         choices = [f"{a['Name']}  [{', '.join(r)}]" for a, r in flagged]
         return f"Found {len(flagged)} junk artist(s) — review and deselect any to keep:", gr.update(choices=choices, value=choices, visible=True)
     except Exception as e:
@@ -323,6 +333,10 @@ def _normalize_for_dedup(name: str) -> str:
     n = name.lower().strip()
     if n.endswith(", the"):
         n = "the " + n[:-5]
+    # Normalize punctuation so AC/DC == AC-DC == ACDC
+    n = re.sub(r"[/\-–—&+]", " ", n)
+    n = re.sub(r"[^\w\s]", "", n)
+    n = re.sub(r"\s+", " ", n).strip()
     return n
 
 
@@ -348,34 +362,87 @@ def scan_artist_duplicates(threshold: int) -> tuple[str, Any]:
         artist_duplicate_pairs = pairs
         if not pairs:
             return "✅ No duplicate artists found", gr.update(choices=[], visible=False)
-        choices = [f"{a['Name']}  ↔  {b['Name']}" for a, b in pairs]
-        return f"Found {len(pairs)} likely duplicate pair(s):", gr.update(choices=choices, value=[], visible=True)
+        choices = [
+            f"{a['Name']} ({a.get('ChildCount', 0)} albums)  ↔  {b['Name']} ({b.get('ChildCount', 0)} albums)"
+            for a, b in pairs
+        ]
+        return f"Found {len(pairs)} likely duplicate pair(s) — select pairs to merge, then choose which name to keep:", gr.update(choices=choices, value=[], visible=True)
     except Exception as e:
         return f"❌ Scan failed: {e}", gr.update(choices=[], visible=False)
 
 
 def merge_selected_artist_pairs(selected: list[str], preferred_side: str) -> str:
-    """Rename both artists in each selected pair to the preferred side's name."""
+    """Merge duplicate artist pairs at the track level:
+    - Exact-name matches → delete the loser's copy (keep winner's)
+    - Unique tracks on loser → reassign to canonical artist name
+    - Rename loser artist entry to canonical, then delete it
+    """
     if not jellyfin_client:
         return "❌ Connect to Jellyfin first"
     if not selected:
         return "❌ No pairs selected"
-    merged, errors = 0, []
+
+    merged_pairs, report, errors = 0, [], []
+
     for a, b in artist_duplicate_pairs:
-        label = f"{a['Name']}  ↔  {b['Name']}"
+        label = f"{a['Name']} ({a.get('ChildCount', 0)} albums)  ↔  {b['Name']} ({b.get('ChildCount', 0)} albums)"
         if label not in selected:
             continue
-        canonical = a["Name"] if preferred_side == "left" else b["Name"]
-        for artist in (a, b):
-            if artist["Name"] != canonical:
-                try:
-                    jellyfin_client.rename_artist(artist["Id"], canonical, canonical)
-                    merged += 1
-                except Exception as e:
-                    errors.append(f"{artist['Name']}: {e}")
-    msg = f"✅ Renamed {merged} artist(s)"
+
+        winner = a if preferred_side == "left" else b
+        loser  = b if preferred_side == "left" else a
+        canonical = winner["Name"]
+
+        try:
+            winner_tracks = jellyfin_client.get_tracks_for_artist(winner["Id"])
+            loser_tracks  = jellyfin_client.get_tracks_for_artist(loser["Id"])
+
+            # Build normalized name → track id map for winner
+            winner_track_map: dict[str, str] = {
+                t["Name"].lower().strip(): t["Id"] for t in winner_tracks
+            }
+
+            deleted_dupes, reassigned = 0, 0
+            for track in loser_tracks:
+                norm = track["Name"].lower().strip()
+                if norm in winner_track_map:
+                    # Duplicate track — delete loser's copy
+                    try:
+                        jellyfin_client.delete_item(track["Id"])
+                        deleted_dupes += 1
+                    except Exception as te:
+                        errors.append(f"Delete track '{track['Name']}': {te}")
+                else:
+                    # Unique track — reassign to canonical artist
+                    try:
+                        jellyfin_client.update_track_artist(track["Id"], canonical)
+                        reassigned += 1
+                    except Exception as te:
+                        errors.append(f"Reassign track '{track['Name']}': {te}")
+
+            # Rename loser artist entry then delete it
+            try:
+                jellyfin_client.rename_artist(loser["Id"], canonical, canonical)
+            except Exception:
+                pass
+            try:
+                jellyfin_client.delete_item(loser["Id"])
+            except Exception as de:
+                errors.append(f"Delete artist '{loser['Name']}': {de}")
+
+            report.append(
+                f"✔ **{loser['Name']}** → **{canonical}**: "
+                f"{deleted_dupes} duplicate track(s) removed, {reassigned} unique track(s) reassigned"
+            )
+            merged_pairs += 1
+
+        except Exception as e:
+            errors.append(f"{a['Name']} ↔ {b['Name']}: {e}")
+
+    msg = f"✅ Merged {merged_pairs} pair(s).\n\n" + "\n".join(report)
     if errors:
         msg += "\n\n❌ Errors:\n" + "\n".join(errors)
+    msg += "\n\n💡 **Tip:** Run Jellyfin → Dashboard → Libraries → Scan All Libraries to finalize."
     return msg
 
 
@@ -428,7 +495,19 @@ def refresh_selected_artwork(selected: list[str]) -> str:
 # Playlist generation (existing)
 # ---------------------------------------------------------------------------
 
-def generate_playlist_preview(artist_input: str, playlist_style: str, track_count: int) -> tuple[str, str]:
+_TRACK_SOURCES = [
+    ("Top Hits (most popular)", "top"),
+    ("Deep Cuts (least popular)", "deep"),
+    ("Chronological (oldest first)", "chrono"),
+    ("Recent Releases (newest first)", "recent"),
+    ("Shuffled", "shuffle"),
+]
+
+_DECADES = ["Any era", "1950s", "1960s", "1970s", "1980s", "1990s", "2000s", "2010s", "2020s"]
+
+
+def generate_playlist_preview(artist_input: str, playlist_style: str, track_count: int,
+                              track_source: str, decade: str) -> tuple[str, str]:
     global pending_playlist
     pending_playlist = {}
 
@@ -448,21 +527,50 @@ def generate_playlist_preview(artist_input: str, playlist_style: str, track_coun
     if not artist_names:
         return "❌ No valid artist names", ""
 
+    # Decade filter bounds
+    decade_start, decade_end = 0, 9999
+    if decade and decade != "Any era":
+        decade_start = int(decade[:4])
+        decade_end = decade_start + 9
+
     try:
-        result_lines = []
+        all_spotify_tracks: list[dict] = []
+        artist_for_track: dict[str, str] = {}  # track name -> artist
+
+        for artist_name in artist_names:
+            tracks = spotify_client.get_top_tracks(artist_name, limit=200)
+            # Apply decade filter
+            if decade != "Any era":
+                tracks = [t for t in tracks if decade_start <= t.get("release_year", 0) <= decade_end]
+            for t in tracks:
+                artist_for_track[t["name"]] = artist_name
+            all_spotify_tracks.extend(tracks)
+
+        # Sort / order by source
+        if track_source == "top":
+            all_spotify_tracks.sort(key=lambda t: t.get("popularity", 0), reverse=True)
+        elif track_source == "deep":
+            all_spotify_tracks.sort(key=lambda t: t.get("popularity", 0))
+        elif track_source == "chrono":
+            all_spotify_tracks.sort(key=lambda t: t.get("release_year", 0))
+        elif track_source == "recent":
+            all_spotify_tracks.sort(key=lambda t: t.get("release_year", 0), reverse=True)
+        elif track_source == "shuffle":
+            random.shuffle(all_spotify_tracks)
+
         matched_track_ids: list[str] = []
         matched_tracks: list[str] = []
 
-        for artist_name in artist_names:
-            spotify_tracks = spotify_client.get_top_tracks(artist_name, limit=track_count * 3)
-            for track in spotify_tracks:
-                if len(matched_track_ids) >= track_count:
-                    break
-                jf_track = jellyfin_client.find_track(artist_name, track['name'])
-                if jf_track:
-                    matched_track_ids.append(jf_track.get("Id"))
-                    matched_tracks.append(f"{track['name']} — {artist_name}")
-            result_lines.append(f"🎵 {artist_name}: matched {len(matched_track_ids)} tracks so far")
+        for track in all_spotify_tracks:
+            if len(matched_track_ids) >= track_count:
+                break
+            artist_name = artist_for_track.get(track["name"], artist_names[0])
+            jf_track = jellyfin_client.find_track(artist_name, track["name"])
+            if jf_track:
+                matched_track_ids.append(jf_track.get("Id"))
+                year = track.get("release_year") or ""
+                year_str = f" ({year})" if year else ""
+                matched_tracks.append(f"{track['name']}{year_str} — {artist_name}")
 
         if not matched_track_ids:
             return "❌ No matching tracks found in Jellyfin", ""
@@ -473,7 +581,10 @@ def generate_playlist_preview(artist_input: str, playlist_style: str, track_coun
             "track_ids": matched_track_ids,
         }
 
-        preview = f"Playlist: **{playlist_name}**\n\n" + "\n".join(matched_tracks[:track_count])
+        source_label = next((l for l, v in _TRACK_SOURCES if v == track_source), track_source)
+        decade_label = f" · {decade}" if decade != "Any era" else ""
+        header = f"Playlist: **{playlist_name}**  ·  {source_label}{decade_label}  ·  {len(matched_track_ids)} tracks\n\n"
+        preview = header + "\n".join(matched_tracks)
         return preview, ""
     except Exception as e:
         pending_playlist = {}
@@ -592,6 +703,16 @@ def delete_selected_m3u(selected: list[str]) -> str:
         return f"❌ Delete failed: {e}"
 
 
+def select_all_artwork() -> Any:
+    choices = [i.get("Name", i["Id"]) for i in missing_artwork_items]
+    return gr.update(value=choices)
+
+
+def select_all_junk() -> Any:
+    choices = [f"{a['Name']}  [{', '.join(label for pattern, label in _JUNK_RULES if re.match(pattern, a['Name']))}]" for a in junk_artist_candidates]
+    return gr.update(value=choices)
+
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Jellyfin Music Cleanup") as demo:
         gr.Markdown("# Jellyfin Music Cleanup\nManage duplicates and generate playlists using Jellyfin + Spotify.")
@@ -650,16 +771,28 @@ def build_ui() -> gr.Blocks:
 
         with gr.Tab("Playlists"):
             artist_input = gr.Textbox(label="Artist name(s) (comma-separated)")
-            playlist_style = gr.Dropdown(
-                label="Playlist style",
-                choices=[
-                    ("Why X Slaps", "slaps"),
-                    ("Certified X Bangers", "bangers"),
-                    ("The X Experience", "experience"),
-                ],
-                value="slaps",
-            )
-            track_count = gr.Slider(5, 50, value=20, step=1, label="Max tracks")
+            with gr.Row():
+                playlist_style = gr.Dropdown(
+                    label="Playlist name style",
+                    choices=[
+                        ("Why X Slaps", "slaps"),
+                        ("Certified X Bangers", "bangers"),
+                        ("The X Experience", "experience"),
+                    ],
+                    value="slaps",
+                )
+                track_source = gr.Dropdown(
+                    label="Track selection",
+                    choices=_TRACK_SOURCES,
+                    value="top",
+                )
+            with gr.Row():
+                track_count = gr.Slider(5, 50, value=20, step=1, label="Max tracks")
+                decade = gr.Dropdown(
+                    label="Era filter",
+                    choices=_DECADES,
+                    value="Any era",
+                )
             preview_btn = gr.Button("Preview Playlist")
             preview_md = gr.Markdown("")
             save_btn = gr.Button("Save to Jellyfin")
@@ -667,7 +800,7 @@ def build_ui() -> gr.Blocks:
 
             preview_btn.click(
                 generate_playlist_preview,
-                inputs=[artist_input, playlist_style, track_count],
+                inputs=[artist_input, playlist_style, track_count, track_source, decade],
                 outputs=[preview_md, save_status],
             )
             save_btn.click(save_playlist, outputs=save_status)
@@ -719,17 +852,26 @@ To stop them coming back, either:
             ja_scan_btn = gr.Button("Scan for Junk Artists")
             ja_status = gr.Markdown("")
             ja_list = gr.CheckboxGroup(label="Select artists to delete", choices=[], visible=False)
+            with gr.Row():
+                ja_all_btn = gr.Button("Select All", size="sm")
+                ja_none_btn = gr.Button("Deselect All", size="sm")
             ja_delete_btn = gr.Button("Delete Selected", variant="stop")
             ja_result = gr.Markdown("")
 
             ja_scan_btn.click(scan_junk_artists, outputs=[ja_status, ja_list])
+            ja_all_btn.click(select_all_junk, outputs=ja_list)
+            ja_none_btn.click(lambda: gr.update(value=[]), outputs=ja_list)
             ja_delete_btn.click(delete_selected_junk_artists, inputs=[ja_list], outputs=ja_result)
 
         # -------------------------------------------------------------------
         with gr.Tab("🔀 Duplicate Artists"):
             gr.Markdown(
-                "Finds artist pairs using fuzzy matching — catches 'The Beatles' vs 'Beatles, The', "
-                "slight spelling differences, etc. Select pairs to merge and choose which name to keep."
+                "Finds artist pairs using fuzzy matching — catches 'AC/DC' vs 'AC-DC', "
+                "'Alice in Chains' vs 'Alice In Chains', etc.\n\n"
+                "**Merge works at the track level:** tracks with the same name under both artists "
+                "are treated as duplicates — the loser's copy is deleted. "
+                "Unique tracks on the loser are reassigned to the winner's name. "
+                "The loser artist entry is then removed. A library rescan completes the consolidation."
             )
             da_threshold = gr.Slider(70, 99, value=90, step=1, label="Similarity Threshold")
             da_scan_btn = gr.Button("Scan for Duplicate Artists")
@@ -761,10 +903,15 @@ To stop them coming back, either:
             mw_scan_btn = gr.Button("Scan for Missing Artwork")
             mw_status = gr.Markdown("")
             mw_list = gr.CheckboxGroup(label="Select items to refresh", choices=[], visible=False)
+            with gr.Row():
+                mw_all_btn = gr.Button("Select All", size="sm")
+                mw_none_btn = gr.Button("Deselect All", size="sm")
             mw_refresh_btn = gr.Button("Refresh Metadata for Selected", variant="primary")
             mw_result = gr.Markdown("")
 
             mw_scan_btn.click(scan_missing_artwork, inputs=[mw_type], outputs=[mw_status, mw_list])
+            mw_all_btn.click(select_all_artwork, outputs=mw_list)
+            mw_none_btn.click(lambda: gr.update(value=[]), outputs=mw_list)
             mw_refresh_btn.click(refresh_selected_artwork, inputs=[mw_list], outputs=mw_result)
 
         # -------------------------------------------------------------------

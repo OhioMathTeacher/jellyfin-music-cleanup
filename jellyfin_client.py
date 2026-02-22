@@ -7,7 +7,11 @@ Minimal client for Jellyfin music libraries using the REST API + API key.
 from dataclasses import dataclass
 from typing import Optional
 import requests
+import urllib3
 from rapidfuzz import fuzz
+
+# Jellyfin commonly uses self-signed certs on LAN — suppress the noise
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 @dataclass
@@ -44,7 +48,7 @@ class JellyfinClient:
         }
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        resp = requests.get(f"{self.base_url}{path}", headers=self._headers(), params=params, timeout=30)
+        resp = requests.get(f"{self.base_url}{path}", headers=self._headers(), params=params, timeout=30, verify=False)
         resp.raise_for_status()
         return resp.json()
 
@@ -55,6 +59,7 @@ class JellyfinClient:
             json=json_body,
             params=params,
             timeout=30,
+            verify=False,
         )
         resp.raise_for_status()
         return resp.json() if resp.text else {}
@@ -155,6 +160,61 @@ class JellyfinClient:
         params = {"Ids": ",".join(item_ids)}
         self._post(f"/Playlists/{playlist_id}/Items", params=params)
 
+    def get_albums_for_artist(self, artist_id: str) -> list[dict]:
+        """Return all albums whose AlbumArtist matches this artist id."""
+        params = {
+            "IncludeItemTypes": "MusicAlbum",
+            "Recursive": "true",
+            "Fields": "AlbumArtist,AlbumArtists,ChildCount,SortName",
+            "ArtistIds": artist_id,
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
+    def get_tracks_for_album(self, album_id: str) -> list[dict]:
+        """Return all audio tracks in an album."""
+        params = {
+            "IncludeItemTypes": "Audio",
+            "Recursive": "true",
+            "Fields": "Artists,AlbumArtist,AlbumArtists",
+            "ParentId": album_id,
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
+    def update_album_artist(self, album_id: str, canonical_name: str) -> None:
+        """Reassign an album to a different artist name."""
+        body = {
+            "AlbumArtist": canonical_name,
+            "AlbumArtists": [{"Name": canonical_name}],
+        }
+        self._post(f"/Items/{album_id}", json_body=body)
+
+    def update_track_artist(self, track_id: str, canonical_name: str) -> None:
+        """Update the artist tag on a single track."""
+        body = {
+            "AlbumArtist": canonical_name,
+            "Artists": [canonical_name],
+        }
+        self._post(f"/Items/{track_id}", json_body=body)
+
+    def get_tracks_for_artist(self, artist_id: str) -> list[dict]:
+        """Return all audio tracks for an artist (by ArtistIds)."""
+        params = {
+            "IncludeItemTypes": "Audio",
+            "Recursive": "true",
+            "Fields": "Artists,AlbumArtist,Album,RunTimeTicks,Path",
+            "ArtistIds": artist_id,
+            "UserId": self.user_id,
+            "Limit": 50000,
+        }
+        data = self._get("/Items", params=params)
+        return data.get("Items", [])
+
     def get_all_playlists(self) -> list[dict]:
         params = {
             "IncludeItemTypes": "Playlist",
@@ -171,6 +231,7 @@ class JellyfinClient:
             f"{self.base_url}/Items/{item_id}",
             headers=self._headers(),
             timeout=30,
+            verify=False,
         )
         if not resp.ok:
             body = ""
@@ -216,6 +277,7 @@ class JellyfinClient:
             headers=self._headers(),
             params=params,
             timeout=30,
+            verify=False,
         )
         resp.raise_for_status()
 
